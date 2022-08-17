@@ -46,6 +46,7 @@ import org.slf4j.LoggerFactory;
 import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.Objects;
 import java.util.Optional;
@@ -179,8 +180,11 @@ class SegmentedRaftLogWorker {
   private final boolean asyncFlush;
   private final boolean unsafeFlush;
   private final ExecutorService flushExecutor;
-  private final AtomicReference<CompletableFuture<Void>> flushFuture
+  private final AtomicReference<CompletableFuture<Object>> flushFuture
       = new AtomicReference<>(CompletableFuture.completedFuture(null));
+  private final AtomicReference<CompletableFuture<Object>> smFlushFuture
+      = new AtomicReference<>(CompletableFuture.completedFuture(null));
+  private PriorityBlockingQueue flushQueue;
 
   private final StateMachineDataPolicy stateMachineDataPolicy;
 
@@ -226,8 +230,13 @@ class SegmentedRaftLogWorker {
       throw new IllegalStateException("Cannot enable both " +  RaftServerConfigKeys.Log.UNSAFE_FLUSH_ENABLED_KEY +
           " and " + RaftServerConfigKeys.Log.ASYNC_FLUSH_ENABLED_KEY);
     }
-    this.flushExecutor = (!asyncFlush && !unsafeFlush)? null
-        : Executors.newSingleThreadExecutor(ConcurrentUtils.newThreadFactory(name + "-flush"));
+    this.flushExecutor = (!asyncFlush && !unsafeFlush)? null : createFlushExecutor();
+  }
+
+  ThreadPoolExecutor createFlushExecutor() {
+    flushQueue = new PriorityBlockingQueue(100, new BufferedWriteChannel.RunnableComparator());
+    return new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, flushQueue,
+        ConcurrentUtils.newThreadFactory(name + "-flush"));
   }
 
   void start(long latestIndex, long evictIndex, File openSegmentFile) throws IOException {
@@ -402,17 +411,26 @@ class SegmentedRaftLogWorker {
 
   private void unsafeFlushOutStream() throws IOException {
     final Timer.Context logSyncTimerContext = raftLogSyncTimer.time();
-    out.asyncFlush(flushExecutor).whenComplete((v, e) -> logSyncTimerContext.stop());
+    out.asyncFlush(flushExecutor, lastWrittenIndex).whenComplete((v, e) -> logSyncTimerContext.stop());
   }
 
   private void asyncFlushOutStream(CompletableFuture<Void> stateMachineFlush) throws IOException {
     final Timer.Context logSyncTimerContext = raftLogSyncTimer.time();
-    final CompletableFuture<Void> f = out.asyncFlush(flushExecutor)
-        .thenCombine(stateMachineFlush, (async, sm) -> async);
-    flushFuture.updateAndGet(previous -> f.thenCombine(previous, (current, prev) -> current))
-        .whenComplete((v, e) -> {
+    smFlushFuture.updateAndGet(previous -> stateMachineFlush.thenCombine(previous, (pre, current) -> current));
+    final CompletableFuture<Object> f = out.asyncFlush(flushExecutor, lastWrittenIndex);
+    flushFuture.updateAndGet(previous -> f).whenComplete((v, e) -> {
           updateFlushedIndexIncreasingly(lastWrittenIndex);
           logSyncTimerContext.stop();
+
+          // remove unnecessary flush tasks
+          Iterator iterator = flushQueue.iterator();
+          while (iterator.hasNext()) {
+            BufferedWriteChannel.PriorityTask task = (BufferedWriteChannel.PriorityTask) iterator.next();
+            if (task.priority() != -1 && task.priority() <= lastWrittenIndex) {
+              iterator.remove();
+              task.getFuture().complete(null);
+            }
+          }
         });
   }
 

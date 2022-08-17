@@ -58,7 +58,7 @@ public class SegmentedRaftLogOutputStream implements Closeable {
   private final long preallocatedSize;
 
   public SegmentedRaftLogOutputStream(File file, boolean append, long segmentMaxSize,
-      long preallocatedSize, ByteBuffer byteBuffer, Supplier<CompletableFuture<Void>> flushFuture)
+      long preallocatedSize, ByteBuffer byteBuffer, Supplier<CompletableFuture<Object>> flushFuture)
       throws IOException {
     this.file = file;
     this.checksum = new PureJavaCrc32C();
@@ -126,9 +126,9 @@ public class SegmentedRaftLogOutputStream implements Closeable {
     }
   }
 
-  CompletableFuture<Void> asyncFlush(ExecutorService executor) throws IOException {
+  CompletableFuture<Object> asyncFlush(ExecutorService executor, long index) throws IOException {
     try {
-      return out.asyncFlush(executor);
+      return out.asyncFlush(executor, index);
     } catch (IOException ioe) {
       String msg = "Failed to asyncFlush " + this;
       LOG.error(msg, ioe);
