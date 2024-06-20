@@ -58,7 +58,7 @@ import static org.apache.ratis.util.LifeCycle.State.NEW;
 import static org.apache.ratis.util.LifeCycle.State.RUNNING;
 import static org.apache.ratis.util.LifeCycle.State.STARTING;
 
-import com.codahale.metrics.Timer;
+import org.apache.ratis.thirdparty.com.codahale.metrics.Timer;
 
 /**
  * For a candidate to start an election for becoming the leader.
@@ -322,13 +322,14 @@ class LeaderElection implements Runnable {
           case NOT_IN_CONF:
           case SHUTDOWN:
             server.getRaftServer().close();
+            server.getStateMachine().event().notifyServerShutdown(server.getRoleInfoProto());
             return false;
           case TIMEOUT:
             continue; // should retry
           case REJECTED:
           case DISCOVERED_A_NEW_TERM:
             final long term = r.maxTerm(server.getState().getCurrentTerm());
-            server.changeToFollowerAndPersistMetadata(term, r);
+            server.changeToFollowerAndPersistMetadata(term, false, r);
             return false;
           default: throw new IllegalArgumentException("Unable to process result " + r.result);
         }

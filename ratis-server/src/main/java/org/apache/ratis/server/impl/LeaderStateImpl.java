@@ -364,12 +364,11 @@ class LeaderStateImpl implements LeaderState {
   /**
    * Start bootstrapping new peers
    */
-  PendingRequest startSetConfiguration(SetConfigurationRequest request) {
+  PendingRequest startSetConfiguration(SetConfigurationRequest request, List<RaftPeer> peersInNewConf) {
     LOG.info("{}: startSetConfiguration {}", this, request);
     Preconditions.assertTrue(running && !inStagingState());
 
-    final List<RaftPeer> peersInNewConf = request.getPeersInNewConf();
-    final List<RaftPeer> listenersInNewConf = request.getListenersInNewConf();
+    final List<RaftPeer> listenersInNewConf = request.getArguments().getPeersInNewConf(RaftPeerRole.LISTENER);
     final Collection<RaftPeer> peersToBootStrap = server.getRaftConf().filterNotContainedInConf(peersInNewConf);
     final Collection<RaftPeer> listenersToBootStrap= server.getRaftConf().filterNotContainedInConf(listenersInNewConf);
 
@@ -419,7 +418,7 @@ class LeaderStateImpl implements LeaderState {
   CompletableFuture<RaftClientReply> addWatchReqeust(RaftClientRequest request) {
     LOG.debug("{}: addWatchRequest {}", this, request);
     return watchRequests.add(request)
-        .thenApply(v -> server.newSuccessReply(request))
+        .thenApply(logIndex -> server.newSuccessReply(request, logIndex))
         .exceptionally(e -> exception2RaftClientReply(request, e));
   }
 
@@ -559,7 +558,7 @@ class LeaderStateImpl implements LeaderState {
 
   private void stepDown(long term, StepDownReason reason) {
     try {
-      server.changeToFollowerAndPersistMetadata(term, reason);
+      server.changeToFollowerAndPersistMetadata(term, false, reason);
       pendingStepDown.complete(server::newSuccessReply);
     } catch(IOException e) {
       final String s = this + ": Failed to persist metadata for term " + term;
@@ -659,7 +658,8 @@ class LeaderStateImpl implements LeaderState {
     final Timestamp progressTime = Timestamp.currentTime().addTimeMs(-server.getMaxTimeoutMs());
     final Timestamp timeoutTime = Timestamp.currentTime().addTimeMs(-3L * server.getMaxTimeoutMs());
     if (follower.getLastRpcResponseTime().compareTo(timeoutTime) < 0) {
-      LOG.debug("{} detects a follower {} timeout ({}) for bootstrapping", this, follower, timeoutTime);
+      LOG.debug("{} detects a follower {} timeout ({}ms) for bootstrapping", this, follower,
+          follower.getLastRpcResponseTime().elapsedTimeMs());
       return BootStrapProgress.NOPROGRESS;
     } else if (follower.getMatchIndex() + stagingCatchupGap > committed
         && follower.getLastRpcResponseTime().compareTo(progressTime) > 0
@@ -954,7 +954,9 @@ class LeaderStateImpl implements LeaderState {
       final RaftPeerId followerID = followerInfo.getPeer().getId();
       final RaftPeer follower = conf.getPeer(followerID);
       if (follower == null) {
-        LOG.error("{} the follower {} is not in the conf {}", this, server.getId(), conf);
+        if (conf.getPeer(followerID, RaftPeerRole.LISTENER) == null) {
+          LOG.error("{} the follower {} is not in the conf {}", this, followerID, conf);
+        }
         continue;
       }
       final int followerPriority = follower.getPriority();
@@ -1077,7 +1079,7 @@ class LeaderStateImpl implements LeaderState {
     }
 
     boolean contains(RaftPeerId peerId) {
-      return newPeers.containsKey(peerId);
+      return newPeers.containsKey(peerId) || newListeners.containsKey(peerId);
     }
 
     void fail(BootStrapProgress progress) {

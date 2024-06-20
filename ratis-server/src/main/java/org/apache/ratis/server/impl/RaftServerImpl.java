@@ -23,6 +23,7 @@ import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.proto.RaftProtos.*;
 import org.apache.ratis.proto.RaftProtos.RaftClientRequestProto.TypeCase;
 import org.apache.ratis.protocol.*;
+import org.apache.ratis.protocol.exceptions.SetConfigurationException;
 import org.apache.ratis.protocol.exceptions.GroupMismatchException;
 import org.apache.ratis.protocol.exceptions.LeaderNotReadyException;
 import org.apache.ratis.protocol.exceptions.LeaderSteppingDownException;
@@ -78,6 +79,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static org.apache.ratis.proto.RaftProtos.AppendEntriesReplyProto.AppendResult.INCONSISTENCY;
 import static org.apache.ratis.proto.RaftProtos.AppendEntriesReplyProto.AppendResult.NOT_LEADER;
@@ -90,7 +92,7 @@ import static org.apache.ratis.util.LifeCycle.State.PAUSING;
 import static org.apache.ratis.util.LifeCycle.State.RUNNING;
 import static org.apache.ratis.util.LifeCycle.State.STARTING;
 
-import com.codahale.metrics.Timer;
+import org.apache.ratis.thirdparty.com.codahale.metrics.Timer;
 import org.apache.ratis.util.function.CheckedSupplier;
 
 class RaftServerImpl implements RaftServer.Division,
@@ -301,10 +303,12 @@ class RaftServerImpl implements RaftServer.Division,
     this.role.transitionRole(newRole);
   }
 
-  boolean start() {
+  boolean start() throws IOException {
     if (!lifeCycle.compareAndTransition(NEW, STARTING)) {
       return false;
     }
+    state.initialize(stateMachine);
+
     final RaftConfigurationImpl conf = getRaftConf();
     if (conf != null && conf.containsInBothConfs(getId())) {
       LOG.info("{}: start as a follower, conf={}", getMemberId(), conf);
@@ -491,14 +495,18 @@ class RaftServerImpl implements RaftServer.Division,
    * @param force Force to start a new {@link FollowerState} even if this server is already a follower.
    * @return if the term/votedFor should be updated to the new term
    */
-  private synchronized boolean changeToFollower(long newTerm, boolean force, Object reason) {
+  private synchronized boolean changeToFollower(
+      long newTerm,
+      boolean force,
+      boolean allowListener,
+      Object reason) {
     final RaftPeerRole old = role.getCurrentRole();
-    if (old == RaftPeerRole.LISTENER) {
+    final boolean metadataUpdated = state.updateCurrentTerm(newTerm);
+    if (old == RaftPeerRole.LISTENER && !allowListener) {
       throw new IllegalStateException("Unexpected role " + old);
     }
-    final boolean metadataUpdated = state.updateCurrentTerm(newTerm);
 
-    if (old != RaftPeerRole.FOLLOWER || force) {
+    if ((old != RaftPeerRole.FOLLOWER || force) && old != RaftPeerRole.LISTENER) {
       setRole(RaftPeerRole.FOLLOWER, reason);
       if (old == RaftPeerRole.LEADER) {
         role.shutdownLeaderState(false);
@@ -512,8 +520,11 @@ class RaftServerImpl implements RaftServer.Division,
     return metadataUpdated;
   }
 
-  synchronized void changeToFollowerAndPersistMetadata(long newTerm, Object reason) throws IOException {
-    if (changeToFollower(newTerm, false, reason)) {
+  synchronized void changeToFollowerAndPersistMetadata(
+      long newTerm,
+      boolean allowListener,
+      Object reason) throws IOException {
+    if (changeToFollower(newTerm, false, allowListener, reason)) {
       state.persistMetadata();
     }
   }
@@ -568,6 +579,7 @@ class RaftServerImpl implements RaftServer.Division,
       roleInfo.setCandidateInfo(candidate);
       break;
 
+    case LISTENER:
     case FOLLOWER:
       final Optional<FollowerState> fs = role.getFollowerState();
       final ServerRpcProto leaderInfo = ServerProtoUtils.toServerRpcProto(
@@ -1086,7 +1098,7 @@ class RaftServerImpl implements RaftServer.Division,
       return reply;
     }
 
-    final List<RaftPeer> peersInNewConf = request.getPeersInNewConf();
+    final SetConfigurationRequest.Arguments arguments = request.getArguments();
     final PendingRequest pending;
     synchronized (this) {
       reply = checkLeaderState(request, null, false);
@@ -1102,18 +1114,52 @@ class RaftServerImpl implements RaftServer.Division,
             "Reconfiguration is already in progress: " + current);
       }
 
+      final List<RaftPeer> serversInNewConf;
+      final List<RaftPeer> listenersInNewConf;
+      if (arguments.getMode() == SetConfigurationRequest.Mode.ADD) {
+        serversInNewConf = add(RaftPeerRole.FOLLOWER, current, arguments);
+        listenersInNewConf = add(RaftPeerRole.LISTENER, current, arguments);
+      } else if (arguments.getMode() == SetConfigurationRequest.Mode.COMPARE_AND_SET) {
+        final Comparator<RaftPeer> comparator = Comparator.comparing(RaftPeer::getId,
+            Comparator.comparing(RaftPeerId::toString));
+        if (CollectionUtils.equalsIgnoreOrder(arguments.getServersInCurrentConf(),
+            current.getAllPeers(RaftPeerRole.FOLLOWER), comparator)
+            && CollectionUtils.equalsIgnoreOrder(arguments.getListenersInCurrentConf(),
+            current.getAllPeers(RaftPeerRole.LISTENER), comparator)) {
+          serversInNewConf = arguments.getPeersInNewConf(RaftPeerRole.FOLLOWER);
+          listenersInNewConf = arguments.getPeersInNewConf(RaftPeerRole.LISTENER);
+        } else {
+          throw new SetConfigurationException("Failed to set configuration: current configuration "
+              + current + " is different than the request " + request);
+        }
+      } else {
+        serversInNewConf = arguments.getPeersInNewConf(RaftPeerRole.FOLLOWER);
+        listenersInNewConf = arguments.getPeersInNewConf(RaftPeerRole.LISTENER);
+      }
+
       // return success with a null message if the new conf is the same as the current
-      if (current.hasNoChange(peersInNewConf)) {
+      if (current.hasNoChange(serversInNewConf, listenersInNewConf)) {
         pending = new PendingRequest(request);
         pending.setReply(newSuccessReply(request));
         return pending.getFuture();
       }
 
-      getRaftServer().addRaftPeers(peersInNewConf);
+      getRaftServer().addRaftPeers(serversInNewConf);
+      getRaftServer().addRaftPeers(listenersInNewConf);
       // add staging state into the leaderState
-      pending = leaderState.startSetConfiguration(request);
+      pending = leaderState.startSetConfiguration(request, serversInNewConf);
     }
     return pending.getFuture();
+  }
+
+  static List<RaftPeer> add(RaftPeerRole role, RaftConfigurationImpl conf, SetConfigurationRequest.Arguments args) {
+    final Map<RaftPeerId, RaftPeer> inConfs = conf.getAllPeers(role).stream()
+        .collect(Collectors.toMap(RaftPeer::getId, Function.identity()));
+
+    final List<RaftPeer> toAdds = args.getPeersInNewConf(role);
+    toAdds.stream().map(RaftPeer::getId).forEach(inConfs::remove);
+
+    return Stream.concat(toAdds.stream(), inConfs.values().stream()).collect(Collectors.toList());
   }
 
   /**
@@ -1165,7 +1211,8 @@ class RaftServerImpl implements RaftServer.Division,
       final boolean voteGranted = context.decideVote(candidate, candidateLastEntry);
       if (candidate != null && phase == Phase.ELECTION) {
         // change server state in the ELECTION phase
-        final boolean termUpdated = changeToFollower(candidateTerm, true, "candidate:" + candidateId);
+        final boolean termUpdated =
+            changeToFollower(candidateTerm, true, false, "candidate:" + candidateId);
         if (voteGranted) {
           state.grantVote(candidate.getId());
         }
@@ -1300,7 +1347,8 @@ class RaftServerImpl implements RaftServer.Division,
     logAppendEntries(isHeartbeat,
         () -> getMemberId() + ": receive appendEntries(" + leaderId + ", " + leaderTerm + ", "
             + previous + ", " + leaderCommit + ", " + initializing
-            + ", commits" + ProtoUtils.toString(commitInfos)
+            + ", commits:" + ProtoUtils.toString(commitInfos)
+            + ", cId:" + callId
             + ", entries: " + LogProtoUtils.toLogEntriesString(entries));
 
     final long currentTerm;
@@ -1323,7 +1371,7 @@ class RaftServerImpl implements RaftServer.Division,
         return CompletableFuture.completedFuture(reply);
       }
       try {
-        changeToFollowerAndPersistMetadata(leaderTerm, "appendEntries");
+        changeToFollowerAndPersistMetadata(leaderTerm, true, "appendEntries");
       } catch (IOException e) {
         return JavaUtils.completeExceptionally(e);
       }
@@ -1356,8 +1404,13 @@ class RaftServerImpl implements RaftServer.Division,
         : state.getLog().append(entries);
     commitInfos.forEach(commitInfoCache::update);
 
+    CodeInjectionForTesting.execute(LOG_SYNC, getId(), null);
     if (!isHeartbeat) {
-      CodeInjectionForTesting.execute(LOG_SYNC, getId(), null);
+      final long installedIndex = snapshotInstallationHandler.getInstalledIndex();
+      if (installedIndex >= RaftLog.LEAST_VALID_LOG_INDEX) {
+        LOG.info("{}: Follower has completed install the snapshot {}.", this, installedIndex);
+        stateMachine.event().notifySnapshotInstalled(InstallSnapshotResult.SUCCESS, installedIndex);
+      }
     }
     return JavaUtils.allOf(futures).whenCompleteAsync(
         (r, t) -> followerState.ifPresent(fs -> fs.updateLastRpcTime(FollowerState.UpdateType.APPEND_COMPLETE))

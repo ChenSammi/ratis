@@ -44,6 +44,7 @@ import org.apache.ratis.proto.netty.NettyProtos.RaftNettyServerReplyProto;
 import org.apache.ratis.proto.netty.NettyProtos.RaftNettyServerRequestProto;
 import org.apache.ratis.util.CodeInjectionForTesting;
 import org.apache.ratis.util.JavaUtils;
+import org.apache.ratis.util.MemoizedSupplier;
 import org.apache.ratis.util.ProtoUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -84,7 +85,8 @@ public final class NettyRpcService extends RaftServerRpcWithProxy<NettyRpcProxy,
 
   private final EventLoopGroup bossGroup = new NioEventLoopGroup();
   private final EventLoopGroup workerGroup = new NioEventLoopGroup();
-  private final ChannelFuture channelFuture;
+  private final MemoizedSupplier<ChannelFuture> channel;
+  private final InetSocketAddress socketAddress;
 
   @ChannelHandler.Sharable
   class InboundHandler extends SimpleChannelInboundHandler<RaftNettyServerRequestProto> {
@@ -115,13 +117,16 @@ public final class NettyRpcService extends RaftServerRpcWithProxy<NettyRpcProxy,
       }
     };
 
+    final String host = NettyConfigKeys.Server.host(server.getProperties());
     final int port = NettyConfigKeys.Server.port(server.getProperties());
-    channelFuture = new ServerBootstrap()
+    socketAddress =
+            host == null || host.isEmpty() ? new InetSocketAddress(port) : new InetSocketAddress(host, port);
+    this.channel = JavaUtils.memoize(() -> new ServerBootstrap()
         .group(bossGroup, workerGroup)
         .channel(NioServerSocketChannel.class)
         .handler(new LoggingHandler(LogLevel.INFO))
         .childHandler(initializer)
-        .bind(port);
+        .bind(socketAddress));
   }
 
   @Override
@@ -130,13 +135,16 @@ public final class NettyRpcService extends RaftServerRpcWithProxy<NettyRpcProxy,
   }
 
   private Channel getChannel() {
-    return channelFuture.awaitUninterruptibly().channel();
+    if (!channel.isInitialized()) {
+      throw new IllegalStateException(getId() + ": Failed to getChannel since the service is not yet started");
+    }
+    return channel.get().awaitUninterruptibly().channel();
   }
 
   @Override
   public void startImpl() throws IOException {
     try {
-      channelFuture.syncUninterruptibly();
+      channel.get().syncUninterruptibly();
     } catch(Exception t) {
       throw new IOException(getId() + ": Failed to start " + JavaUtils.getClassSimpleName(getClass()), t);
     }
@@ -160,7 +168,14 @@ public final class NettyRpcService extends RaftServerRpcWithProxy<NettyRpcProxy,
 
   @Override
   public InetSocketAddress getInetSocketAddress() {
-    return (InetSocketAddress)getChannel().localAddress();
+    try {
+      return (InetSocketAddress) getChannel().localAddress();
+    } catch (IllegalStateException e) {
+      if (socketAddress.getPort() != NettyConfigKeys.Server.PORT_DEFAULT) {
+        return socketAddress;
+      }
+      throw e;
+    }
   }
 
   RaftNettyServerReplyProto handle(RaftNettyServerRequestProto proto) {

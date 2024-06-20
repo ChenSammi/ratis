@@ -26,7 +26,7 @@ import static org.apache.ratis.server.metrics.RaftServerMetricsImpl.REQUEST_MEGA
 import static org.apache.ratis.server.metrics.RaftServerMetricsImpl.REQUEST_BYTE_SIZE_LIMIT_HIT_COUNTER;
 import static org.apache.ratis.server.metrics.RaftServerMetricsImpl.RESOURCE_LIMIT_HIT_COUNTER;
 
-import com.codahale.metrics.Gauge;
+import org.apache.ratis.thirdparty.com.codahale.metrics.Gauge;
 import org.apache.log4j.Level;
 import org.apache.ratis.BaseTest;
 import org.apache.ratis.protocol.RaftGroup;
@@ -62,22 +62,32 @@ import org.apache.ratis.util.TimeDuration;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 
 import java.io.IOException;
 import java.nio.channels.OverlappingFileLockException;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.SortedMap;
+import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
+@RunWith(Parameterized.class)
 public class TestRaftServerWithGrpc extends BaseTest implements MiniRaftClusterWithGrpc.FactoryGet {
   {
     Log4jUtils.setLogLevel(GrpcClientProtocolClient.LOG, Level.ALL);
+  }
+
+  public TestRaftServerWithGrpc(Boolean separateHeartbeat) {
+    GrpcConfigKeys.Server.setHeartbeatChannel(getProperties(), separateHeartbeat);
+  }
+
+  @Parameterized.Parameters
+  public static Collection<Boolean[]> data() {
+    return Arrays.asList((new Boolean[][] {{Boolean.FALSE}, {Boolean.TRUE}}));
   }
 
   @Before
@@ -125,9 +135,10 @@ public class TestRaftServerWithGrpc extends BaseTest implements MiniRaftClusterW
     // the raft server proxy created earlier. Raft server proxy should close
     // the rpc server on failure.
     RaftServerConfigKeys.setStorageDir(p, Collections.singletonList(cluster.getStorageDir(leaderId)));
-    testFailureCase("start a new server with the same address",
+    testFailureCase("Starting a new server with the same address should fail",
         () -> newRaftServer(cluster, leaderId, stateMachine, p).start(),
-        IOException.class, OverlappingFileLockException.class);
+        CompletionException.class, LOG, IOException.class, OverlappingFileLockException.class);
+
     // Try to start a raft server rpc at the leader address.
     cluster.getServerFactory(leaderId).newRaftServerRpc(cluster.getServer(leaderId));
   }

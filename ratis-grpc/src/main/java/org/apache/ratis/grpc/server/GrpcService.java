@@ -42,8 +42,8 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.function.Supplier;
 
@@ -103,7 +103,7 @@ public final class GrpcService extends RaftServerRpcWithProxy<GrpcServerProtocol
     return new Builder();
   }
 
-  private final List<Server> servers = new ArrayList<>(3);
+  private final Map<String, Server> servers = new HashMap<>();
   private final Supplier<InetSocketAddress> addressSupplier;
   private final Supplier<InetSocketAddress> clientServerAddressSupplier;
   private final Supplier<InetSocketAddress> adminServerAddressSupplier;
@@ -126,7 +126,8 @@ public final class GrpcService extends RaftServerRpcWithProxy<GrpcServerProtocol
         GrpcConfigKeys.messageSizeMax(server.getProperties(), LOG::info),
         RaftServerConfigKeys.Log.Appender.bufferByteLimit(server.getProperties()),
         GrpcConfigKeys.flowControlWindow(server.getProperties(), LOG::info),
-        RaftServerConfigKeys.Rpc.requestTimeout(server.getProperties()));
+        RaftServerConfigKeys.Rpc.requestTimeout(server.getProperties()),
+        GrpcConfigKeys.Server.heartbeatChannel(server.getProperties()));
   }
 
   @SuppressWarnings("checkstyle:ParameterNumber") // private constructor
@@ -135,10 +136,11 @@ public final class GrpcService extends RaftServerRpcWithProxy<GrpcServerProtocol
       int clientPort, GrpcTlsConfig clientTlsConfig,
       int serverPort, GrpcTlsConfig serverTlsConfig,
       SizeInBytes grpcMessageSizeMax, SizeInBytes appenderBufferSize,
-      SizeInBytes flowControlWindow,TimeDuration requestTimeoutDuration) {
+      SizeInBytes flowControlWindow,TimeDuration requestTimeoutDuration,
+      boolean useSeparateHBChannel) {
     super(idSupplier, id -> new PeerProxyMap<>(id.toString(),
         p -> new GrpcServerProtocolClient(p, flowControlWindow.getSizeInt(),
-            requestTimeoutDuration, serverTlsConfig)));
+            requestTimeoutDuration, serverTlsConfig, useSeparateHBChannel)));
     if (appenderBufferSize.getSize() > grpcMessageSizeMax.getSize()) {
       throw new IllegalArgumentException("Illegal configuration: "
           + RaftServerConfigKeys.Log.Appender.BUFFER_BYTE_LIMIT_KEY + " = " + appenderBufferSize
@@ -172,7 +174,7 @@ public final class GrpcService extends RaftServerRpcWithProxy<GrpcServerProtocol
     }
 
     final Server server = serverBuilder.build();
-    servers.add(server);
+    servers.put(GrpcServerProtocolService.class.getSimpleName(), server);
     addressSupplier = newAddressSupplier(serverPort, server);
 
     if (separateAdminServer) {
@@ -180,7 +182,7 @@ public final class GrpcService extends RaftServerRpcWithProxy<GrpcServerProtocol
           startBuildingNettyServer(adminPort, adminTlsConfig, grpcMessageSizeMax, flowControlWindow);
       addAdminService(raftServer, builder);
       final Server adminServer = builder.build();
-      servers.add(adminServer);
+      servers.put(GrpcAdminProtocolService.class.getName(), adminServer);
       adminServerAddressSupplier = newAddressSupplier(adminPort, adminServer);
     } else {
       adminServerAddressSupplier = addressSupplier;
@@ -191,7 +193,7 @@ public final class GrpcService extends RaftServerRpcWithProxy<GrpcServerProtocol
           startBuildingNettyServer(clientPort, clientTlsConfig, grpcMessageSizeMax, flowControlWindow);
       addClientService(builder);
       final Server clientServer = builder.build();
-      servers.add(clientServer);
+      servers.put(GrpcClientProtocolService.class.getName(), clientServer);
       clientServerAddressSupplier = newAddressSupplier(clientPort, clientServer);
     } else {
       clientServerAddressSupplier = addressSupplier;
@@ -251,7 +253,7 @@ public final class GrpcService extends RaftServerRpcWithProxy<GrpcServerProtocol
 
   @Override
   public void startImpl() {
-    for (Server server : servers) {
+    for (Server server : servers.values()) {
       try {
         server.start();
       } catch (IOException e) {
@@ -264,10 +266,10 @@ public final class GrpcService extends RaftServerRpcWithProxy<GrpcServerProtocol
 
   @Override
   public void closeImpl() throws IOException {
-    for (Server server : servers) {
-      final String name = getId() + ": shutdown server with port " + server.getPort();
+    for (Map.Entry<String, Server> server : servers.entrySet()) {
+      final String name = getId() + ": shutdown server " + server.getKey();
       LOG.info("{} now", name);
-      final Server s = server.shutdownNow();
+      final Server s = server.getValue().shutdownNow();
       super.closeImpl();
       try {
         s.awaitTermination();

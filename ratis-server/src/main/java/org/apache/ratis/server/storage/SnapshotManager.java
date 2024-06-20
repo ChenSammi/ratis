@@ -21,7 +21,10 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.channels.FileChannel;
-import java.util.UUID;
+import java.nio.file.Path;
+import java.security.DigestOutputStream;
+import java.security.MessageDigest;
+import java.util.function.Supplier;
 
 import org.apache.ratis.io.CorruptedFileException;
 import org.apache.ratis.io.MD5Hash;
@@ -32,6 +35,7 @@ import org.apache.ratis.statemachine.SnapshotInfo;
 import org.apache.ratis.statemachine.StateMachine;
 import org.apache.ratis.util.FileUtils;
 import org.apache.ratis.util.IOUtils;
+import org.apache.ratis.util.JavaUtils;
 import org.apache.ratis.util.MD5FileUtil;
 import org.apache.ratis.util.Preconditions;
 import org.apache.ratis.util.StringUtils;
@@ -51,6 +55,7 @@ public class SnapshotManager {
 
   private final RaftStorage storage;
   private final RaftPeerId selfId;
+  private final Supplier<MessageDigest> digester = JavaUtils.memoize(MD5Hash::getDigester);
 
   public SnapshotManager(RaftStorage storage, RaftPeerId selfId) {
     this.storage = storage;
@@ -65,7 +70,7 @@ public class SnapshotManager {
     final RaftStorageDirectory dir = storage.getStorageDir();
 
     // create a unique temporary directory
-    final File tmpDir =  new File(dir.getTmpDir(), UUID.randomUUID().toString());
+    final File tmpDir =  new File(dir.getTmpDir(), "snapshot-" + snapshotChunkRequest.getRequestId());
     FileUtils.createDirectories(tmpDir);
     tmpDir.deleteOnExit();
 
@@ -74,6 +79,7 @@ public class SnapshotManager {
     // TODO: Make sure that subsequent requests for the same installSnapshot are coming in order,
     // and are not lost when whole request cycle is done. Check requestId and requestIndex here
 
+    final Path stateMachineDir = dir.getStateMachineDir().toPath();
     for (FileChunkProto chunk : snapshotChunkRequest.getFileChunksList()) {
       SnapshotInfo pi = stateMachine.getLatestSnapshot();
       if (pi != null && pi.getTermIndex().getIndex() >= lastIncludedIndex) {
@@ -83,9 +89,9 @@ public class SnapshotManager {
       }
 
       String fileName = chunk.getFilename(); // this is relative to the root dir
-      // TODO: assumes flat layout inside SM dir
-      File tmpSnapshotFile = new File(tmpDir,
-          new File(dir.getRoot(), fileName).getName());
+      final Path relative = stateMachineDir.relativize(new File(dir.getRoot(), fileName).toPath());
+      final File tmpSnapshotFile = new File(tmpDir, relative.toString());
+      FileUtils.createDirectories(tmpSnapshotFile);
 
       FileOutputStream out = null;
       try {
@@ -105,7 +111,9 @@ public class SnapshotManager {
         }
 
         // write data to the file
-        out.write(chunk.getData().toByteArray());
+        try (DigestOutputStream digestOut = new DigestOutputStream(out, digester.get())) {
+          digestOut.write(chunk.getData().toByteArray());
+        }
       } finally {
         IOUtils.cleanup(null, out);
       }
@@ -117,7 +125,7 @@ public class SnapshotManager {
             new MD5Hash(chunk.getFileDigest().toByteArray());
         // calculate the checksum of the snapshot file and compare it with the
         // file digest in the request
-        MD5Hash digest = MD5FileUtil.computeMd5ForFile(tmpSnapshotFile);
+        final MD5Hash digest = new MD5Hash(digester.get().digest());
         if (!digest.equals(expectedDigest)) {
           LOG.warn("The snapshot md5 digest {} does not match expected {}",
               digest, expectedDigest);

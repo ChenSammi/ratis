@@ -194,12 +194,12 @@ public abstract class MiniRaftCluster implements Closeable {
     }
 
     protected String getAddress(RaftPeerId id, RaftGroup g, Function<RaftPeer, String> getAddress) {
-      final RaftPeer p = g != null? g.getPeer(id): peers.get(id);
+      final RaftPeer p = getPeer(id, g);
       return p == null? null : getAddress.apply(p);
     }
 
     protected int getDataStreamPort(RaftPeerId id, RaftGroup g) {
-      final RaftPeer p = g != null? g.getPeer(id): peers.get(id);
+      final RaftPeer p = getPeer(id, g);
       final String address = p == null? null : p.getDataStreamAddress();
       return getPort(address);
     }
@@ -283,32 +283,22 @@ public abstract class MiniRaftCluster implements Closeable {
   public MiniRaftCluster initServers() {
     LOG.info("servers = " + servers);
     if (servers.isEmpty()) {
-      putNewServers(CollectionUtils.as(group.getPeers(), RaftPeer::getId),
-          true, false);
+      putNewServers(CollectionUtils.as(group.getPeers(), RaftPeer::getId), true, group);
     }
     return this;
   }
 
   public RaftServerProxy putNewServer(RaftPeerId id, RaftGroup group, boolean format) {
     final RaftServerProxy s = newRaftServer(id, group, format);
+    peers.put(s.getId(), s.getPeer());
     Preconditions.assertTrue(servers.put(id, s) == null);
-    peers.put(id, s.getPeer());
     return s;
   }
 
-  private Collection<RaftServer> putNewServers(
-      Iterable<RaftPeerId> peers, boolean format, boolean emptyPeer) {
-    if (emptyPeer) {
-      RaftGroup raftGroup = RaftGroup.valueOf(group.getGroupId(),
-          Collections.EMPTY_LIST);
+  private Collection<RaftServer> putNewServers(Iterable<RaftPeerId> peers, boolean format, RaftGroup raftGroup) {
       return StreamSupport.stream(peers.spliterator(), false)
           .map(id -> putNewServer(id, raftGroup, format))
           .collect(Collectors.toList());
-    } else {
-      return StreamSupport.stream(peers.spliterator(), false)
-          .map(id -> putNewServer(id, group, format))
-          .collect(Collectors.toList());
-    }
   }
 
   public void start() throws IOException {
@@ -346,7 +336,7 @@ public abstract class MiniRaftCluster implements Closeable {
 
     List<RaftPeerId> idList = new ArrayList<>(servers.keySet());
     servers.clear();
-    putNewServers(idList, format, false);
+    putNewServers(idList, format, group);
     start();
   }
 
@@ -427,15 +417,25 @@ public abstract class MiniRaftCluster implements Closeable {
       boolean emptyPeer) throws IOException {
     LOG.info("Add new peers {}", Arrays.asList(ids));
 
-    // create and add new RaftServers
-    final Collection<RaftServer> newServers = putNewServers(
-        CollectionUtils.as(Arrays.asList(ids), RaftPeerId::valueOf), true, emptyPeer);
+    final Iterable<RaftPeerId> peerIds = CollectionUtils.as(Arrays.asList(ids), RaftPeerId::valueOf);
+    final RaftGroup raftGroup;
+    if (emptyPeer) {
+      raftGroup = RaftGroup.valueOf(group.getGroupId(), Collections.emptyList());
+    } else {
+      final Collection<RaftPeer> newPeers = StreamSupport.stream(peerIds.spliterator(), false)
+          .map(id -> RaftPeer.newBuilder().setId(id).build())
+          .collect(Collectors.toSet());
+      newPeers.addAll(group.getPeers());
+      raftGroup = RaftGroup.valueOf(group.getGroupId(), newPeers);
+    }
 
-    startServers(newServers);
-    if (!startNewPeer) {
-      // start and then close, in order to bind the port
+    // create and add new RaftServers
+    final Collection<RaftServer> newServers = putNewServers(peerIds, true, raftGroup);
+
+    if (startNewPeer) {
+      // start the server
       for(RaftServer s : newServers) {
-        s.close();
+        s.start();
       }
     }
 
@@ -447,9 +447,10 @@ public abstract class MiniRaftCluster implements Closeable {
     return new PeerChanges(p, np, RaftPeer.emptyArray());
   }
 
-  static void startServers(Iterable<? extends RaftServer> servers) throws IOException {
+  void startServers(Iterable<? extends RaftServer> servers) throws IOException {
     for(RaftServer s : servers) {
       s.start();
+      peers.put(s.getId(), s.getPeer());
     }
   }
 
@@ -672,6 +673,23 @@ public abstract class MiniRaftCluster implements Closeable {
     return toRaftPeers(getServers());
   }
 
+  RaftPeer getPeer(RaftPeerId id, RaftGroup group) {
+    RaftPeer p = peers.get(id);
+    if (p != null) {
+      return p;
+    }
+    if (group != null) {
+      p = group.getPeer(id);
+    }
+    if (p == null) {
+      p = Optional.ofNullable(servers.get(id)).map(RaftServerProxy::getPeer).orElse(null);
+    }
+    if (p != null) {
+      peers.put(id, p);
+    }
+    return p;
+  }
+
   public RaftGroup getGroup() {
     return group;
   }
@@ -740,7 +758,7 @@ public abstract class MiniRaftCluster implements Closeable {
       ClientId clientId, RaftPeerId leaderId,
       RaftPeer... peers) {
     return new SetConfigurationRequest(clientId, leaderId, getGroupId(), CallId.getDefault(),
-        Arrays.asList(peers), Collections.emptyList());
+        SetConfigurationRequest.Arguments.newBuilder().setServersInNewConf(peers).build());
   }
 
   public void setConfiguration(RaftPeer... peers) throws IOException {

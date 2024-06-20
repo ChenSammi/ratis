@@ -1,4 +1,4 @@
-/*
+/**
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -15,21 +15,26 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.ratis.client;
+package org.apache.ratis.grpc;
 
-import org.apache.ratis.client.api.AsyncApi;
-import org.apache.ratis.protocol.RaftClientReply;
-import org.apache.ratis.protocol.RaftClientRequest;
+import org.apache.ratis.InstallSnapshotFromLeaderTests;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 
-import java.util.concurrent.CompletableFuture;
+import java.util.Arrays;
+import java.util.Collection;
 
-/** An RPC interface which extends the user interface {@link AsyncApi}. */
-public interface AsyncRpcApi extends AsyncApi {
-  /**
-   * Send the given forward-request asynchronously to the raft service.
-   *
-   * @param request The request to be forwarded.
-   * @return a future of the reply.
-   */
-  CompletableFuture<RaftClientReply> sendForward(RaftClientRequest request);
+@RunWith(Parameterized.class)
+public class TestLeaderInstallSnapshot
+extends InstallSnapshotFromLeaderTests<MiniRaftClusterWithGrpc>
+implements MiniRaftClusterWithGrpc.FactoryGet {
+
+    public TestLeaderInstallSnapshot(Boolean separateHeartbeat) {
+        GrpcConfigKeys.Server.setHeartbeatChannel(getProperties(), separateHeartbeat);
+    }
+
+    @Parameterized.Parameters
+    public static Collection<Boolean[]> data() {
+        return Arrays.asList((new Boolean[][] {{Boolean.FALSE}, {Boolean.TRUE}}));
+    }
 }

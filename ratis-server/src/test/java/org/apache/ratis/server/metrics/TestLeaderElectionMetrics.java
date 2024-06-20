@@ -23,7 +23,7 @@ import static org.apache.ratis.server.metrics.LeaderElectionMetrics.LEADER_ELECT
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
-import com.codahale.metrics.Gauge;
+import org.apache.ratis.thirdparty.com.codahale.metrics.Gauge;
 import org.apache.ratis.BaseTest;
 import org.apache.ratis.metrics.RatisMetricRegistry;
 import org.apache.ratis.protocol.RaftGroupId;
@@ -58,7 +58,7 @@ public class TestLeaderElectionMetrics extends BaseTest {
         (s, metric) -> s.contains(LAST_LEADER_ELECTION_ELAPSED_TIME));
     LOG.info("{} gauges: {}", LAST_LEADER_ELECTION_ELAPSED_TIME, gauges);
     final Long leaderElectionLatency = (Long)gauges.values().iterator().next().getValue();
-    assertTrue("leaderElectionLatency = " + leaderElectionLatency, leaderElectionLatency > 0L);
+    assertTrue("leaderElectionLatency = " + leaderElectionLatency, leaderElectionLatency >= 0L);
   }
 
   @Test

@@ -15,21 +15,15 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.ratis.client;
+package org.apache.ratis.protocol.exceptions;
 
-import org.apache.ratis.client.api.AsyncApi;
-import org.apache.ratis.protocol.RaftClientReply;
-import org.apache.ratis.protocol.RaftClientRequest;
+public class SetConfigurationException extends RaftException {
 
-import java.util.concurrent.CompletableFuture;
+  public SetConfigurationException(String message) {
+    super(message);
+  }
 
-/** An RPC interface which extends the user interface {@link AsyncApi}. */
-public interface AsyncRpcApi extends AsyncApi {
-  /**
-   * Send the given forward-request asynchronously to the raft service.
-   *
-   * @param request The request to be forwarded.
-   * @return a future of the reply.
-   */
-  CompletableFuture<RaftClientReply> sendForward(RaftClientRequest request);
+  public SetConfigurationException(String message, Throwable t) {
+    super(message, t);
+  }
 }

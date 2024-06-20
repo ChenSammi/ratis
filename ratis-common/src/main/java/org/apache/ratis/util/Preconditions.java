@@ -78,6 +78,11 @@ public interface Preconditions {
         () -> name + ": expected == " + expected + " but computed == " + computed);
   }
 
+  static void assertSame(Object expected, Object computed, String name) {
+    assertTrue(expected == computed,
+        () -> name + ": expected == " + expected + " but computed == " + computed);
+  }
+
   static void assertNull(Object object, Supplier<String> message) {
     assertTrue(object == null, message);
   }
@@ -95,6 +100,11 @@ public interface Preconditions {
   static <T> T assertNotNull(T object, String name) {
     return assertNotNull(object, () -> name + " is expected to not be null but "
         + name + " = " + object + " == null, class = " + object.getClass());
+  }
+
+  static <T> T assertNotNull(T object, String format, Object... args) {
+    assertTrue(object != null, format, args);
+    return object;
   }
 
   static <T> T assertInstanceOf(Object object, Class<T> clazz) {

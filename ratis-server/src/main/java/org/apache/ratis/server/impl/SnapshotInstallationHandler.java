@@ -64,6 +64,7 @@ class SnapshotInstallationHandler {
   private final AtomicReference<TermIndex> installedSnapshotTermIndex =
     new AtomicReference<>(INVALID_TERM_INDEX);
   private final AtomicBoolean isSnapshotNull = new AtomicBoolean();
+  private final AtomicLong installedIndex = new AtomicLong(INVALID_LOG_INDEX);
 
   SnapshotInstallationHandler(RaftServerImpl server, RaftProperties properties) {
     this.server = server;
@@ -73,6 +74,10 @@ class SnapshotInstallationHandler {
 
   RaftGroupMemberId getMemberId() {
     return state.getMemberId();
+  }
+
+  long getInstalledIndex() {
+    return installedIndex.getAndSet(INVALID_LOG_INDEX);
   }
 
   long getInProgressInstallSnapshotIndex() {
@@ -160,7 +165,7 @@ class SnapshotInstallationHandler {
         LOG.warn("{}: Failed to recognize leader for installSnapshot chunk.", getMemberId());
         return reply;
       }
-      server.changeToFollowerAndPersistMetadata(leaderTerm, "installSnapshot");
+      server.changeToFollowerAndPersistMetadata(leaderTerm, true, "installSnapshot");
       state.setLeader(leaderId, "installSnapshot");
 
       server.updateLastRpcTime(FollowerState.UpdateType.INSTALL_SNAPSHOT_START);
@@ -207,7 +212,7 @@ class SnapshotInstallationHandler {
         LOG.warn("{}: Failed to recognize leader for installSnapshot notification.", getMemberId());
         return reply;
       }
-      server.changeToFollowerAndPersistMetadata(leaderTerm, "installSnapshot");
+      server.changeToFollowerAndPersistMetadata(leaderTerm, true, "installSnapshot");
       state.setLeader(leaderId, "installSnapshot");
       server.updateLastRpcTime(FollowerState.UpdateType.INSTALL_SNAPSHOT_NOTIFICATION);
 
@@ -299,6 +304,8 @@ class SnapshotInstallationHandler {
         LOG.info("{}: InstallSnapshot notification result: {}", getMemberId(),
             InstallSnapshotResult.SNAPSHOT_UNAVAILABLE);
         inProgressInstallSnapshotIndex.set(INVALID_LOG_INDEX);
+        server.getStateMachine().event().notifySnapshotInstalled(
+            InstallSnapshotResult.SNAPSHOT_UNAVAILABLE, INVALID_LOG_INDEX);
         return ServerProtoUtils.toInstallSnapshotReplyProto(leaderId, getMemberId(),
             currentTerm, InstallSnapshotResult.SNAPSHOT_UNAVAILABLE, -1);
       }
@@ -314,6 +321,10 @@ class SnapshotInstallationHandler {
         LOG.info("{}: InstallSnapshot notification result: {}, at index: {}", getMemberId(),
             InstallSnapshotResult.SNAPSHOT_INSTALLED, latestInstalledSnapshotTermIndex);
         inProgressInstallSnapshotIndex.set(INVALID_LOG_INDEX);
+        final long latestInstalledIndex = latestInstalledSnapshotTermIndex.getIndex();
+        server.getStateMachine().event().notifySnapshotInstalled(
+            InstallSnapshotResult.SNAPSHOT_INSTALLED, latestInstalledIndex);
+        installedIndex.set(latestInstalledIndex);
         return ServerProtoUtils.toInstallSnapshotReplyProto(leaderId, getMemberId(),
             currentTerm, InstallSnapshotResult.SNAPSHOT_INSTALLED, latestInstalledSnapshotTermIndex.getIndex());
       }
